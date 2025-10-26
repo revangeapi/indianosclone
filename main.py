@@ -147,59 +147,36 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=8080, debug=False)
 
 class CloneBotManager:
-    """Manages clone bots to avoid conflicts"""
+    """Manages clone bots using webhook mode to avoid conflicts"""
     def __init__(self, main_bot):
         self.main_bot = main_bot
-        self.clone_processes = {}
-        self.running_clones = set()
+        self.active_clones = {}
         
-    def start_clone_bot(self, bot_token, owner_id, clone_name):
-        """Start a clone bot in separate process to avoid conflicts"""
-        if bot_token in self.running_clones:
-            logger.info(f"Clone bot {clone_name} is already running")
-            return
+    async def create_clone_bot(self, bot_token, owner_id, clone_name):
+        """Create and setup a clone bot (without starting polling)"""
+        try:
+            # Create the clone bot application but don't start polling
+            clone_app = Application.builder().token(bot_token).build()
             
-        def run_clone():
-            try:
-                # Add delay to avoid immediate conflict
-                time.sleep(2)
-                
-                # Create new application instance
-                clone_app = Application.builder().token(bot_token).build()
-                
-                # Setup basic handlers for clone bot
-                clone_app.add_handler(CommandHandler("start", self.clone_start_command))
-                clone_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.clone_handle_message))
-                
-                logger.info(f"🔄 Starting clone bot: {clone_name}")
-                
-                # Store in main bot's clone_bots dict
-                self.main_bot.clone_bots[bot_token] = {
-                    'app': clone_app,
-                    'owner_id': owner_id,
-                    'started_at': datetime.now(),
-                    'name': clone_name
-                }
-                
-                # Run the clone bot
-                clone_app.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    close_loop=False
-                )
-                
-            except Exception as e:
-                logger.error(f"Clone bot {clone_name} error: {e}")
-                if bot_token in self.running_clones:
-                    self.running_clones.remove(bot_token)
-        
-        # Start in separate thread
-        thread = threading.Thread(target=run_clone)
-        thread.daemon = True
-        thread.start()
-        
-        self.running_clones.add(bot_token)
-        logger.info(f"✅ Clone bot {clone_name} started successfully")
-        
+            # Setup basic handlers for clone bot
+            clone_app.add_handler(CommandHandler("start", self.clone_start_command))
+            clone_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.clone_handle_message))
+            
+            # Store clone info
+            self.active_clones[bot_token] = {
+                'app': clone_app,
+                'owner_id': owner_id,
+                'name': clone_name,
+                'created_at': datetime.now()
+            }
+            
+            logger.info(f"✅ Clone bot {clone_name} setup successfully (webhook mode)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Clone bot setup error: {e}")
+            return False
+
     async def clone_start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command for clone bots"""
         welcome_text = (
@@ -322,7 +299,7 @@ class PhoneLookupBot:
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.clone_manager = CloneBotManager(self)
         self.setup_handlers()
-        self.clone_bots = {}  # Store active clone bots info
+        self.active_clones = {}  # Store active clone bots info
 
     def setup_handlers(self):
         # Command handlers
@@ -559,21 +536,25 @@ class PhoneLookupBot:
             # Store clone in database
             self.db.add_clone(user_id, bot_token, bot_name)
             
-            # Start clone bot using manager (avoids conflicts)
-            self.clone_manager.start_clone_bot(bot_token, user_id, bot_name)
+            # Setup clone bot (without starting polling to avoid conflicts)
+            success = await self.clone_manager.create_clone_bot(bot_token, user_id, bot_name)
             
-            await update.message.reply_text(
-                f"🎉 *Clone Bot Created Successfully!*\n\n"
-                f"• Bot: @{bot_name}\n"
-                f"• Token: `{bot_token[:10]}...`\n"
-                f"• Owner: {user_id}\n\n"
-                f"Your bot is now active and will mirror all broadcasts!\n\n"
-                f"🔗 *Bot Link:* https://t.me/{bot_name}",
-                parse_mode='Markdown'
-            )
-            
-            # Log clone creation
-            await self.log_action(update, f"User {user_id} created clone bot @{bot_name}")
+            if success:
+                await update.message.reply_text(
+                    f"🎉 *Clone Bot Setup Successfully!*\n\n"
+                    f"• Bot: @{bot_name}\n"
+                    f"• Token: `{bot_token[:10]}...`\n"
+                    f"• Owner: {user_id}\n\n"
+                    f"⚠️ *Note:* Clone bots run in webhook mode to avoid conflicts.\n"
+                    f"Your bot is ready to receive messages via webhook.\n\n"
+                    f"🔗 *Bot Link:* https://t.me/{bot_name}",
+                    parse_mode='Markdown'
+                )
+                
+                # Log clone creation
+                await self.log_action(update, f"User {user_id} created clone bot @{bot_name}")
+            else:
+                await update.message.reply_text("❌ *Failed to setup clone bot. Please try again.*", parse_mode='Markdown')
             
         except Exception as e:
             error_msg = str(e)
@@ -602,7 +583,7 @@ class PhoneLookupBot:
         broadcast_id = self.db.add_broadcast(ADMIN_ID, message)
         
         sent_count = 0
-        for clone_data in self.clone_bots.values():
+        for clone_data in self.clone_manager.active_clones.values():
             try:
                 # Send broadcast to clone bot owners
                 await self.application.bot.send_message(
@@ -617,12 +598,12 @@ class PhoneLookupBot:
         await update.message.reply_text(
             f"📢 *Broadcast Sent!*\n\n"
             f"• Message ID: {broadcast_id}\n"
-            f"• Sent to: {sent_count} clone bots\n"
+            f"• Sent to: {sent_count} clone owners\n"
             f"• Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             parse_mode='Markdown'
         )
         
-        await self.log_action(update, f"Admin broadcast sent to {sent_count} clones")
+        await self.log_action(update, f"Admin broadcast sent to {sent_count} clone owners")
 
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command"""
@@ -633,7 +614,7 @@ class PhoneLookupBot:
             return
         
         clones = self.db.get_clones()
-        active_clones = len(self.clone_bots)
+        active_clones = len(self.clone_manager.active_clones)
         
         stats_text = (
             "📊 *Bot Statistics*\n\n"
@@ -971,13 +952,13 @@ class PhoneLookupBot:
         flask_thread.start()
         logger.info("✅ Flask server started on port 8080")
         
-        # Start existing clones from database
+        # Setup existing clones from database (without starting polling)
         clones = self.db.get_clones()
         for clone in clones:
             user_id, clone_token, clone_name = clone[1], clone[2], clone[3]
-            logger.info(f"🔄 Starting existing clone: {clone_name}")
-            # Start with delay to avoid conflicts
-            threading.Timer(5, self.clone_manager.start_clone_bot, args=[clone_token, user_id, clone_name]).start()
+            logger.info(f"🔄 Setting up existing clone: {clone_name}")
+            # Setup clone without starting polling to avoid conflicts
+            asyncio.create_task(self.clone_manager.create_clone_bot(clone_token, user_id, clone_name))
         
         # Start main bot
         self.application.run_polling(
